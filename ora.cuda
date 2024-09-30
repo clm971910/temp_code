@@ -1,0 +1,794 @@
+// This function contains dual descent model's functions.
+#include <cuda_runtime.h>
+#include <thrust/sort.h>
+#include <thrust/execution_policy.h>
+#include <thrust/functional.h>
+#include <malloc.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define BLOCK_VALUE_SIZE 8;
+
+/*
+    There are too many recursive calls in some data scenes when use the quick sort with recursion.
+    Also we can use quick sort without recursion, but this method requires O(N) temporary memory.
+    So we use shell sort with O(N*logN) average time complexity and O(1) space complexity.
+*/
+__device__
+void shellSort(double* arr, int* index, int n) {
+    // the original Shell Sort.
+    for (int gap = n / 2; gap > 0; gap /= 2) {
+        for (int i = 0; i < gap; i++) {
+            for (int j = i + gap; j < n; j += gap) {
+                if (arr[index[j]] > arr[index[j - gap]]) {
+                    int tempIdx = index[j];
+                    double temp = arr[index[j]];
+                    int k = j - gap;
+                    while (k >= 0 && arr[index[k]] < temp) {
+                        index[k + gap] = index[k];
+                        k -= gap;
+                    }
+                    index[k + gap] = tempIdx;
+                }
+            }
+        }
+    }
+}
+
+/*
+    Sort arr and index (at the same time) in descent order.
+*/
+__device__
+void insertionSort(double* arr, int* index, int n) {
+    for (int i=1; i<n; i++) {
+        double key = arr[i];
+        int idx = index[i];
+        int j = i - 1;
+        while ((j>=0) && (arr[j] < key)) {
+            arr[j+1] = arr[j];
+            index[j+1] = index[j];
+            j --;
+        }
+        arr[j+1] = key;
+        index[j+1] = idx;
+    }
+}
+
+/*
+   Calculate primal objective without penalty.This function only needs
+   objective in GPU.
+*/
+extern "C" __global__ void ComputePrimalObjectiveWithoutPenalty(
+    double *scoresVectorData, int *scoresVectorVarIndices,
+    double *primalSolutionData, int variableSize,
+    double alpha, double *output) {
+  int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+  // Variable set I
+  for (int i = threadIndex; i < variableSize; i += stride) {
+    int offset = scoresVectorVarIndices[i];
+    int size = scoresVectorVarIndices[i + 1] - offset;
+    double *originScoresVectorData = scoresVectorData + offset;
+    double *originPrimalSolutionData = primalSolutionData + offset;
+
+    double primalObj = 0.0;
+    // Items set J.
+    for (int j = 0; j < size; j++) {
+      primalObj += originPrimalSolutionData[j] * originScoresVectorData[j];
+      if (originPrimalSolutionData[j] > 1e-50) {
+        primalObj -= alpha * originPrimalSolutionData[j] *
+                     log(originPrimalSolutionData[j]);
+      }
+    }
+    output[i] = primalObj;
+  }
+}
+
+/*
+    Calculate gradient multiple item weigh on GPU.
+    This function needs objective and constraints in GPU.
+*/
+extern "C" __global__ void ComputeGradientWithItemWeight(
+    int *scoresVectorIndex, int *scoresVectorVarIndices,
+    int *constraintsItemWeightIndex, double *constraintsItemWeightData,
+    int *constraintsItemWeightVarIndices, int *constraintsItemMatrixIndex,
+    double *constraintsItemMatrixData, int *constraintsItemMatrixVarIndices,
+    double *primalSolutionData, int variableSize, int constraintSize,
+    double *output) {
+  // Constraints Set K
+  for (int k = threadIdx.x; k < constraintSize; k += blockDim.x) {
+    // Variable set I
+    for (int i = blockIdx.x; i < variableSize; i += gridDim.x) {
+      // Constraints ItemMatrix.
+      int matrixOffset = constraintsItemMatrixVarIndices[k * variableSize + i];
+      int itemSize = constraintsItemMatrixVarIndices[k * variableSize + i + 1] -
+                     matrixOffset;
+      int *originConstraintsItemMatrixIndex =
+          constraintsItemMatrixIndex + matrixOffset;
+      double *originConstraintsItemMatrixData =
+          constraintsItemMatrixData + matrixOffset;
+      int matrixIndex = 0;
+
+      // Constraints ItemWeight
+      int weightOffset = constraintsItemWeightVarIndices[k];
+      int weightSize = constraintsItemWeightVarIndices[k + 1] - weightOffset;
+      int *originConstraintsItemWeightIndex =
+          constraintsItemWeightIndex + weightOffset;
+      double *originConstraintsItemWeightData =
+          constraintsItemWeightData + weightOffset;
+
+      // Use variable scores vector its size equals primal solution data size.
+      int offset = scoresVectorVarIndices[i];
+      int size = scoresVectorVarIndices[i + 1] - offset;
+      int *originScoresVectorIndex = scoresVectorIndex + offset;
+      double *originPrimalSolutionData = primalSolutionData + offset;
+      int primalIndex = 0;
+      double sum = 0.0;
+      for (int j = 0; j < weightSize; j++) {
+        int itemIdxToFind = originConstraintsItemWeightIndex[j];
+        for (; originScoresVectorIndex[primalIndex] < itemIdxToFind &&
+               primalIndex < size; primalIndex++);
+        for (; originConstraintsItemMatrixIndex[matrixIndex] < itemIdxToFind &&
+               matrixIndex < itemSize; matrixIndex++);
+        if (primalIndex >= size || matrixIndex >= itemSize) {
+          break;
+        }
+        if (originScoresVectorIndex[primalIndex] == itemIdxToFind &&
+            originConstraintsItemMatrixIndex[matrixIndex] == itemIdxToFind) {
+          sum += originConstraintsItemWeightData[j] *
+                 originPrimalSolutionData[primalIndex] *
+                 originConstraintsItemMatrixData[matrixIndex];
+        }
+      }
+      output[k * variableSize + i] = sum;
+    }
+  }
+}
+
+__device__ void constructPoolingBlock(double* block, double logValue, double quota, int start, int end){
+    /** The sum value of block. (normalized by maxValue) */
+    block[0] = 1.0;
+
+    /** The log value of block. */
+    block[1] = logValue;
+
+    /** The log quota of block. */
+    block[2] = log(quota);
+
+    /** The quota of block. */
+    block[3] = quota;
+
+    /** The efficiency of block, efficiencyLog = logValue - logQuota */
+    block[4] = logValue - block[2];
+
+    /** The max value in block(Ensure that the value will not overflow). */
+    block[5] = logValue;
+
+    /** The start point of itemList of block. */
+    block[6] = start * 1.0;
+
+    /** The end point of itemList of block. */
+    block[7] = end * 1.0;
+}
+
+/*
+    Merge mergedBlock to preBlock and delete mergedBlock.
+*/
+__device__ void mergePoolingBlock(double* mergedBlock, double* preBlock, int* poolingBlockIndexArrBuffer, int top) {
+    preBlock[5] = max(mergedBlock[5], preBlock[5]);
+    preBlock[0] = exp(mergedBlock[1] - preBlock[5]) + exp(preBlock[1] - preBlock[5]);
+    preBlock[1] = log(preBlock[0]) + preBlock[5];
+    preBlock[3] += mergedBlock[3];
+    preBlock[2] = log(preBlock[3]);
+    preBlock[4] = preBlock[1] - preBlock[2];
+
+    // update preBlock's lastIndex.
+    poolingBlockIndexArrBuffer[top - 2] = poolingBlockIndexArrBuffer[top - 1];
+
+    // update end index of preBlock.
+    preBlock[7] = mergedBlock[7];
+
+    // reset mergedBlock.
+    mergedBlock[0] = 0;
+    mergedBlock[1] = 0;
+    mergedBlock[2] = 0;
+    mergedBlock[3] = 0;
+    mergedBlock[4] = 0;
+    mergedBlock[5] = 0;
+    mergedBlock[6] = 0;
+    mergedBlock[7] = 0;
+}
+
+/*
+    The original efficiencyPoolingProj algorithm.
+*/
+__device__ void efficiencyPoolingProj(double *reRankVector,
+                                        double *solutionVectorVal,
+                                        int *topNIndex, double *topNBiasWeight,
+                                        double* poolingBlockStack,int* poolingBlockIndexArr,
+                                        int vecSize, int biasSize) {
+    // stack pointer
+    int top = 0;
+
+    for(int i = 0; i < vecSize; i++) {
+        double* block = poolingBlockStack + top * BLOCK_VALUE_SIZE;
+
+        // Initialize N blocks where N is the number of slots;
+        if(i < biasSize - 1) {
+            constructPoolingBlock(block, reRankVector[topNIndex[i]], topNBiasWeight[i], 0, 0);
+            poolingBlockIndexArr[top++] = i;
+        }
+        else if(i == biasSize - 1) {
+            double sumLogValue = 0;
+            for (int j = i; j < vecSize; j++) {
+                sumLogValue += exp(reRankVector[topNIndex[j]] - reRankVector[topNIndex[i]]);
+            }
+            constructPoolingBlock(block, log(sumLogValue) + reRankVector[topNIndex[i]], topNBiasWeight[i], 0, 0);
+            poolingBlockIndexArr[top++] = vecSize - 1;
+        } else {
+            break;
+        }
+
+        // A pooling action is taken to merge blocks if there exists two adjacent blocks
+        // with increasing efficiency.
+        // When there is more than 1 block in the stack, start trying to merge.
+        while(top > 1) {
+            double* mergedBlock = poolingBlockStack + (top - 1) * BLOCK_VALUE_SIZE;
+            double* preBlock = poolingBlockStack + (top - 2) * BLOCK_VALUE_SIZE;
+            if (preBlock[4] <= mergedBlock[4] + 1e-10) {
+                // Merge rule: merge mergedBlock into preBlock and modify preBlock's lastIndex.
+                mergePoolingBlock(mergedBlock, preBlock, poolingBlockIndexArr, top);
+                top--;
+            } else {
+                break;
+            }
+        }
+    }
+
+    top--;
+    // Compute primal solution by merged blocks;
+    while (top >= 0) {
+        double* block = poolingBlockStack + top * BLOCK_VALUE_SIZE;
+        double sum = exp(block[1] - block[5]);
+
+        int start = 0;
+
+        if (top > 0) {
+            start = poolingBlockIndexArr[top - 1];
+        }
+
+        int end = poolingBlockIndexArr[top];
+
+        for (int i = start; i <= end; i++) {
+            int index = topNIndex[i];
+            solutionVectorVal[index] = exp(reRankVector[index] - block[5]) / sum * block[3];
+        }
+
+        top--;
+    }
+}
+
+/*
+    The new efficiencyPoolingProj design for a Variable with group constraints.
+*/
+__device__ void efficiencyPoolingProj(double *reRankVector,
+                                      double *solutionVectorVal,
+                                      int *originScoresVectorIndex, double *topNBiasWeight,
+                                      double* poolingBlockStack, int* poolingBlockIndexArr,
+                                      int vecSize, int biasSize,
+                                      int *itemList, int *poolingItemList,
+                                      double *logSumGroupReRankScores, int *groupRankIndexList,
+                                      int groupTopNSize, int *groupItemNumLists,
+                                      double *groupQuotaListBuffer, int groupOffset, int groupNums) {
+    // 0. Get poolingItemList, which corresponds to the item order when we init blocks.
+    int idx = 0;
+    for (int g = 0; g < groupNums; g++) {
+        int groupIdx = groupRankIndexList[g];
+
+        int itemOffset = 0;
+        for (int k = 0; k < groupIdx; k++) {
+            itemOffset += groupItemNumLists[k];
+        }
+
+        for (int i = 0; i < groupItemNumLists[groupIdx]; i++) {
+            poolingItemList[idx] = itemList[itemOffset];
+            idx ++;
+            itemOffset++;
+        }
+    }
+
+    // 1. Calculate quota of each group: loop over topNBiasWeight to get groupQuotaList;
+    double* groupQuotaList = groupQuotaListBuffer + groupOffset;
+    double groupQuota = 0;
+    int groupIndex = 0;
+    for (int i = 0;  i < biasSize; i++) {
+        groupQuota += topNBiasWeight[i];
+        if ((i+1) % groupTopNSize == 0) {
+            groupQuotaList[groupIndex] = groupQuota;
+            groupQuota = 0;
+            groupIndex ++;
+        }
+        if (groupIndex == groupNums) {
+            break;
+        }
+    }
+    double quotaForOtherGroups = 1e-5;
+    for (int g = groupIndex; g < groupNums; g++) {
+        groupQuotaList[g] = quotaForOtherGroups;
+    }
+
+    int top = 0;
+    int itemCount = 0;
+    int start = 0;
+    int end = 0;
+    for(int i = 0; i < groupNums; i++) {
+        // 2. Init each group as a block. Following the order of groupRankIndexList (from higher group to slower group).
+        double* block = poolingBlockStack + top * BLOCK_VALUE_SIZE;
+        int groupItemNums = groupItemNumLists[groupRankIndexList[i]];
+        itemCount += groupItemNums;
+
+        end = start + groupItemNums - 1;
+        constructPoolingBlock(block, logSumGroupReRankScores[groupRankIndexList[i]], groupQuotaList[i], start, end);
+        start += groupItemNums;
+
+        poolingBlockIndexArr[top++] = itemCount - 1;
+        // 3. Pooling action.
+        while(top > 1) {
+            double* mergedBlock = poolingBlockStack + (top - 1) * BLOCK_VALUE_SIZE;
+
+            double* preBlock = poolingBlockStack + (top - 2) * BLOCK_VALUE_SIZE;
+
+            if (preBlock[4] <= mergedBlock[4] + 1e-10) {
+                // Merge rule: merge mergedBlock into preBlock and modify preBlock's lastIndex.
+                mergePoolingBlock(mergedBlock, preBlock, poolingBlockIndexArr, top);
+                top--;
+            } else {
+                break;
+            }
+        }
+    }
+
+    top--;
+    // Compute primal solution by merged blocks.
+    while (top >= 0) {
+
+        double* block = poolingBlockStack + top * BLOCK_VALUE_SIZE;
+        double sum = exp(block[1] - block[5]);
+        int start = (int) block[6];
+        int end = (int) block[7];
+
+        for(int s = start; s <= end; s++) {
+            int itemIdxToFind = poolingItemList[s];
+            int compressedItemIndex = -1;
+            for (int ind = 0; ind < vecSize; ind++) {
+                if (originScoresVectorIndex[ind] == itemIdxToFind) {
+                    compressedItemIndex = ind;
+                    break;
+                }
+            }
+            if (compressedItemIndex == -1) {
+                // if item not found.
+                continue;
+            } else {
+                solutionVectorVal[compressedItemIndex] = exp(reRankVector[compressedItemIndex] - block[5]) / sum * block[3];
+            }
+        }
+        top--;
+    }
+}
+
+/*
+    The original function: Recover primal solution on GPU.
+    This function needs objective and constraints in GPU and solution.lambda
+    from CPU.
+*/
+extern "C" __global__ void RecoverPrimalSolution(
+    int *scoresVectorIndex, double *scoresVectorData,
+    int *scoresVectorVarIndices, int *variablesTopNSizeIndices,
+    double *variablesTopNBiasWeight, int *constraintsItemWeightIndex,
+    double *constraintsItemWeightData, int *constraintsItemWeightVarIndices,
+    int *constraintsItemMatrixIndex, double *constraintsItemMatrixData,
+    int *constraintsItemMatrixVarIndices, double *primalSolutionData,
+
+    double *reRankVectorBuffer,double *keysBuffer,int *topNIndexBuffer,
+    double *poolingBlockStackBuffer,int *poolingBlockIndexArrBuffer,
+
+    int variableSize, int constraintSize, double alpha,
+    int isNeedPrimalRegularizer, double *lambda, double *output) {
+  int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+  // Variable set I
+  for (int i = threadIndex; i < variableSize; i += stride) {
+    int offset = scoresVectorVarIndices[i];
+    int size = scoresVectorVarIndices[i + 1] - offset;
+    if (size == 0) {
+          return;
+    }
+
+    int *originScoresVectorIndex = scoresVectorIndex + offset;
+    double *originScoresVectorData = scoresVectorData + offset;
+    double *originPrimalSolutionData = primalSolutionData + offset;
+
+    double* reRankVector = reRankVectorBuffer + offset;
+    for (int j = 0; j < size; j++) {
+      reRankVector[j] = originScoresVectorData[j];
+    }
+
+    double* poolingBlockStack = poolingBlockStackBuffer + (offset + i) * BLOCK_VALUE_SIZE;
+    int* poolingBlockIndexArr = poolingBlockIndexArrBuffer + (offset + i);
+
+    for (int k = 0; k < constraintSize; k++) {
+      // Constraints ItemWeight
+      int weightOffset = constraintsItemWeightVarIndices[k];
+      int weightSize = constraintsItemWeightVarIndices[k + 1] - weightOffset;
+      int *originConstraintsItemWeightIndex =
+          constraintsItemWeightIndex + weightOffset;
+      double *originConstraintsItemWeightData =
+          constraintsItemWeightData + weightOffset;
+      // Constraints ItemMatrix.
+      int matrixOffset = constraintsItemMatrixVarIndices[k * variableSize + i];
+      int itemSize = constraintsItemMatrixVarIndices[k * variableSize + i + 1] -
+                     matrixOffset;
+      int *originConstraintsItemMatrixIndex =
+          constraintsItemMatrixIndex + matrixOffset;
+      double *originConstraintsItemMatrixData =
+          constraintsItemMatrixData + matrixOffset;
+      int matrixIndex = 0;
+      int index = 0;
+      for (int consJ = 0; consJ < weightSize; consJ++) {
+        int itemIdxToFind = originConstraintsItemWeightIndex[consJ];
+        for (; index < size && originScoresVectorIndex[index] < itemIdxToFind;
+             index++);
+        for (; matrixIndex < itemSize &&
+               originConstraintsItemMatrixIndex[matrixIndex] < itemIdxToFind;
+             matrixIndex++);
+        if (index >= size || matrixIndex >= itemSize) {
+          break;
+        }
+        if (originScoresVectorIndex[index] == itemIdxToFind &&
+            originConstraintsItemMatrixIndex[matrixIndex] == itemIdxToFind) {
+          double weight = originConstraintsItemWeightData[consJ];
+          reRankVector[index] -=
+              lambda[k] * weight * originConstraintsItemMatrixData[matrixIndex];
+        }
+      }
+    }
+
+    double *keys = keysBuffer + offset;
+    int *topNIndex = topNIndexBuffer + offset;
+    for (int j = 0; j < size; j++) {
+      keys[j] = reRankVector[j];
+      topNIndex[j] = j;
+    }
+
+    shellSort(keys, topNIndex, size);
+
+    int topNBiasWeightOffset = variablesTopNSizeIndices[i];
+    int topNBiasWeightLen =
+        variablesTopNSizeIndices[i + 1] - topNBiasWeightOffset;
+    double *originVariablesTopNBiasWeight =
+        variablesTopNBiasWeight + topNBiasWeightOffset;
+    if (isNeedPrimalRegularizer) {
+      for (int j = 0; j < size; j++) {
+        reRankVector[j] /= alpha;
+      }
+
+      efficiencyPoolingProj(reRankVector, originPrimalSolutionData, topNIndex,
+                            originVariablesTopNBiasWeight, poolingBlockStack,
+                            poolingBlockIndexArr, size, topNBiasWeightLen);
+    } else {
+      for (int j = 0; j < size; j++) {
+        int index = topNIndex[j];
+        if (j < topNBiasWeightLen) {
+          originPrimalSolutionData[index] = originVariablesTopNBiasWeight[j];
+        } else {
+          originPrimalSolutionData[index] = 0;
+        }
+      }
+    }
+  }
+}
+
+/*
+    The new function: Recover primal solution on GPU with VarConstraint.
+*/
+extern "C" __global__ void RecoverPrimalSolutionWithVarConstraint(
+    int *scoresVectorIndex, double *scoresVectorData,
+    int *scoresVectorVarIndices, int *variablesTopNSizeIndices,
+    double *variablesTopNBiasWeight, int *constraintsItemWeightIndex,
+    double *constraintsItemWeightData, int *constraintsItemWeightVarIndices,
+    int *constraintsItemMatrixIndex, double *constraintsItemMatrixData,
+    int *constraintsItemMatrixVarIndices, double *primalSolutionData,
+    double *reRankVectorBuffer,double *keysBuffer,int *topNIndexBuffer,
+    double *poolingBlockStackBuffer,int *poolingBlockIndexArrBuffer,
+    int *varConstraintTypes, int *groupTopNSizes,
+    int *itemGroupListGroupNums, int *itemGroupListGroupItemNumLists, int *itemGroupListGroupItemNumIndices,
+    int *itemGroupListData, int *itemGroupListIndices, int *poolingBlockIndices,
+    int *compressedIndicesBuffer, double *avgTopScoreBuffer, double *logSumGroupReRankScoreBuffer,
+    int *groupRankIndexListBuffer, double *reRankScoreBuffer, int *itemIndiceBuffer,
+    int *topNItemCompressedIndiceBuffer, // int *allItemCompressedIndiceBuffer,
+    double *groupQuotaListBuffer, int *poolingItemListBuffer,
+    int variableSize, int constraintSize, double alpha,
+    int isNeedPrimalRegularizer, double *lambda, double *output) {
+  int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+  // Variable set I
+  for (int i = threadIndex; i < variableSize; i += stride) {
+    int offset = scoresVectorVarIndices[i];
+    int size = scoresVectorVarIndices[i + 1] - offset;
+    if (size == 0) {
+          return;
+    }
+
+    int *originScoresVectorIndex = scoresVectorIndex + offset;
+    double *originScoresVectorData = scoresVectorData + offset;
+    double *originPrimalSolutionData = primalSolutionData + offset;
+
+    double* reRankVector = reRankVectorBuffer + offset;
+    for (int j = 0; j < size; j++) {
+      reRankVector[j] = originScoresVectorData[j];
+    }
+
+    for (int k = 0; k < constraintSize; k++) {
+      // Constraints ItemWeight
+      int weightOffset = constraintsItemWeightVarIndices[k];
+      int weightSize = constraintsItemWeightVarIndices[k + 1] - weightOffset;
+      int *originConstraintsItemWeightIndex =
+          constraintsItemWeightIndex + weightOffset;
+      double *originConstraintsItemWeightData =
+          constraintsItemWeightData + weightOffset;
+      // Constraints ItemMatrix.
+      int matrixOffset = constraintsItemMatrixVarIndices[k * variableSize + i];
+      int itemSize = constraintsItemMatrixVarIndices[k * variableSize + i + 1] -
+                     matrixOffset;
+      int *originConstraintsItemMatrixIndex =
+          constraintsItemMatrixIndex + matrixOffset;
+      double *originConstraintsItemMatrixData =
+          constraintsItemMatrixData + matrixOffset;
+      int matrixIndex = 0;
+      int index = 0;
+      for (int consJ = 0; consJ < weightSize; consJ++) {
+        int itemIdxToFind = originConstraintsItemWeightIndex[consJ];
+        for (; index < size && originScoresVectorIndex[index] < itemIdxToFind;
+             index++);
+        for (; matrixIndex < itemSize &&
+               originConstraintsItemMatrixIndex[matrixIndex] < itemIdxToFind;
+             matrixIndex++);
+        if (index >= size || matrixIndex >= itemSize) {
+          break;
+        }
+        if (originScoresVectorIndex[index] == itemIdxToFind &&
+            originConstraintsItemMatrixIndex[matrixIndex] == itemIdxToFind) {
+          double weight = originConstraintsItemWeightData[consJ];
+          reRankVector[index] -=
+              lambda[k] * weight * originConstraintsItemMatrixData[matrixIndex];
+        }
+      }
+    }
+
+    int topNBiasWeightOffset = variablesTopNSizeIndices[i];
+    int topNBiasWeightLen =
+        variablesTopNSizeIndices[i + 1] - topNBiasWeightOffset;
+    double *originVariablesTopNBiasWeight =
+        variablesTopNBiasWeight + topNBiasWeightOffset;
+
+    // If variable has GROUP_EQUAL_CONSTRAINT (e.g. items are divided into groups),
+    // for each group, we reassign the avg score of topN reRank scores to these topN items,
+    // and then do EPP.
+    if (varConstraintTypes[i] == 1) {
+      int groupTopNSize = groupTopNSizes[i];
+      int groupNums = itemGroupListGroupNums[i];
+      int groupOffset = itemGroupListGroupItemNumIndices[i];
+      int itemOffset = itemGroupListIndices[i];
+      int* groupItemNumLists = itemGroupListGroupItemNumLists + groupOffset;
+
+      int* itemList = itemGroupListData + itemOffset;
+      int* compressedIndices = compressedIndicesBuffer + itemOffset;
+
+      // Equalize the reRank scores of topN items in each group.
+      // 1. Get compressedIndices of items according to the order of items in itemList;
+      for (int j = 0; j < size; j++) {
+        int itemIdxToFind = itemList[j];
+        for (int ind = 0; ind < size; ind++) {
+          if (originScoresVectorIndex[ind] == itemIdxToFind) {
+              compressedIndices[j] = ind;
+              break;
+          }
+          // if item not found, set compressedIndices to -1.
+          if (ind == size - 1) {
+              compressedIndices[j] = -1;
+          }
+        }
+      }
+      // 2. Loop for each group, we get the original reRank scores by compressedIndices, calculate its avgTopScore,
+      //    and update reRank scores of topN items accordingly. Btw, avgTopScore / totalScore for each
+      //    group are all stored as input of efficiencyPoolingProj.
+      // 2.0 Initialize vectors for storage;
+      double* avgTopScores = avgTopScoreBuffer + groupOffset;
+      int* groupRankIndexList = groupRankIndexListBuffer + groupOffset;
+
+      // itemsBeforeOffset: item num progress (start from zero) in each Variable
+      int itemsBeforeOffset = 0;
+      int groupsBeforeOffset = 0;
+      for (int g = 0; g < groupNums; g++) {
+        groupRankIndexList[g] = g;
+        // 2.1. Get the original reRankScores by compressedIndices;
+        int groupItemNum = groupItemNumLists[g];
+        // Only for this group: reRankScores and item Indices.
+        double* reRankScores = reRankScoreBuffer + itemOffset + itemsBeforeOffset;
+        int* itemIndices = itemIndiceBuffer + itemOffset + itemsBeforeOffset;
+
+        for (int j = 0; j < groupItemNum; j++) {
+          int idx = j + itemsBeforeOffset;
+          if (compressedIndices[idx] == -1) {
+            reRankScores[j] = 0.0;
+            itemIndices[j] = itemList[idx];
+          } else {
+            reRankScores[j] = reRankVector[compressedIndices[idx]];
+            itemIndices[j] = itemList[idx];
+          }
+        }
+
+        // 2.2. Sort itemIndices by reRankScores, calculate avgTopScore, and get their itemIndex;
+        insertionSort(reRankScores, itemIndices, groupItemNum);
+
+        double totalTopScore = 0;
+        int* topNItemCompressedIndices = topNItemCompressedIndiceBuffer +
+                                         variablesTopNSizeIndices[i] + groupTopNSize * groupsBeforeOffset;
+        for (int j = 0; j < groupTopNSize; j++) {
+          int itemIdxToFind = itemIndices[j];
+
+          for (int ind = 0; ind < size; ind++) {
+            if (originScoresVectorIndex[ind] == itemIdxToFind) {
+              topNItemCompressedIndices[j] = ind;
+              totalTopScore += reRankScores[j];
+              break;
+            }
+            // if item not found
+            if (ind == size - 1) {
+              topNItemCompressedIndices[j] = -1;
+            }
+          }
+        }
+        avgTopScores[g] = totalTopScore / groupTopNSize;
+
+        // 2.3 Update reRankVector of group topN items according to their avg reRank score.
+        for (int j = 0; j < groupTopNSize; j++) {
+          if (topNItemCompressedIndices[j] == -1) {
+              continue;
+          }
+          reRankVector[topNItemCompressedIndices[j]] = avgTopScores[g];
+        }
+        itemsBeforeOffset += groupItemNum;
+        groupsBeforeOffset ++;
+      }
+      // 2.4. rank groups by sort the avgTopScores.
+      shellSort(avgTopScores, groupRankIndexList, groupNums);
+
+      // 2.5. Init memory space for blocks.
+      double* poolingBlockStack = poolingBlockStackBuffer + poolingBlockIndices[i] * BLOCK_VALUE_SIZE;
+      int* poolingBlockIndexArr = poolingBlockIndexArrBuffer + poolingBlockIndices[i];
+      int* poolingItemList = poolingItemListBuffer + offset;
+
+      // 2.6. Init and sort topNIndex according to reRankVector.
+      double *keys = keysBuffer + offset;
+      int *topNIndex = topNIndexBuffer + offset;
+      for (int j = 0; j < size; j++) {
+        keys[j] = reRankVector[j];
+        topNIndex[j] = j;
+      }
+      shellSort(keys, topNIndex, size);
+
+      // 2.7. Call EPP Algorithm
+      if (isNeedPrimalRegularizer) {
+        for (int j = 0; j < size; j++) {
+          reRankVector[j] /= alpha;
+        }
+
+        // calculate logSumGroupReRankScores here.
+        int itemsBeforeOffset = 0;
+        double* logSumGroupReRankScores = logSumGroupReRankScoreBuffer + groupOffset;
+        for (int g = 0; g < groupNums; g++) {
+            logSumGroupReRankScores[g] = 0;
+            double groupMaxScore = avgTopScores[g] / alpha;
+            int groupItemNum = groupItemNumLists[g];
+            for (int j = 0; j < groupItemNum; j++) {
+                int idx = j + itemsBeforeOffset;
+                logSumGroupReRankScores[g] += exp(reRankVector[compressedIndices[idx]] - groupMaxScore);
+            }
+            logSumGroupReRankScores[g] = log(logSumGroupReRankScores[g]) + groupMaxScore;
+            itemsBeforeOffset += groupItemNum;
+        }
+
+        efficiencyPoolingProj(reRankVector, originPrimalSolutionData, originScoresVectorIndex,
+                              originVariablesTopNBiasWeight, poolingBlockStack,
+                              poolingBlockIndexArr, size, topNBiasWeightLen,
+                              itemList, poolingItemList,
+                              logSumGroupReRankScores, groupRankIndexList,
+                              groupTopNSize, groupItemNumLists,
+                              groupQuotaListBuffer, groupOffset, groupNums);
+      } else {
+        for (int j = 0; j < size; j++) {
+          int index = topNIndex[j];
+          if (j < topNBiasWeightLen) {
+            originPrimalSolutionData[index] = originVariablesTopNBiasWeight[j];
+          } else {
+            originPrimalSolutionData[index] = 0;
+          }
+        }
+      }
+    } else {
+      double* poolingBlockStack = poolingBlockStackBuffer + poolingBlockIndices[i] * BLOCK_VALUE_SIZE;
+      int* poolingBlockIndexArr = poolingBlockIndexArrBuffer + poolingBlockIndices[i];
+      double *keys = keysBuffer + offset;
+      int *topNIndex = topNIndexBuffer + offset;
+      for (int j = 0; j < size; j++) {
+        keys[j] = reRankVector[j];
+        topNIndex[j] = j;
+      }
+      shellSort(keys, topNIndex, size);
+
+      if (isNeedPrimalRegularizer) {
+        for (int j = 0; j < size; j++) {
+          reRankVector[j] /= alpha;
+        }
+        efficiencyPoolingProj(reRankVector, originPrimalSolutionData, topNIndex,
+                              originVariablesTopNBiasWeight, poolingBlockStack,
+                              poolingBlockIndexArr, size, topNBiasWeightLen);
+      } else {
+        for (int j = 0; j < size; j++) {
+          int index = topNIndex[j];
+          if (j < topNBiasWeightLen) {
+            originPrimalSolutionData[index] = originVariablesTopNBiasWeight[j];
+          } else {
+            originPrimalSolutionData[index] = 0;
+          }
+        }
+      }
+    }
+  }
+}
+
+/*
+    Override SolverUtils.roundingDecision on GPU.
+*/
+extern "C" __global__ void RoundingDecision(
+    int *scoresVectorVarIndices, double *primalSolutionData,
+    int *variablesTopNSizeIndices, double *variablesTopNBiasWeight,
+    double* keysBuffer,int* topNIndexBuffer,
+    int variableSize) {
+      int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+      int stride = blockDim.x * gridDim.x;
+      // Variable set I
+      for (int i = threadIndex; i < variableSize; i += stride) {
+        int offset = scoresVectorVarIndices[i];
+        int size = scoresVectorVarIndices[i + 1] - offset;
+        double *originPrimalSolutionData = primalSolutionData + offset;
+
+        int topNBiasWeightOffset = variablesTopNSizeIndices[i];
+        int topNBiasWeightLen =
+            variablesTopNSizeIndices[i + 1] - topNBiasWeightOffset;
+        double *originVariablesTopNBiasWeight =
+            variablesTopNBiasWeight + topNBiasWeightOffset;
+
+        double *keys = keysBuffer + offset;
+        int* topNIndex = topNIndexBuffer + offset;
+
+        for (int j = 0; j < size; j++) {
+          keys[j] = originPrimalSolutionData[j];
+          topNIndex[j] = j;
+        }
+
+        shellSort(keys, topNIndex, size);
+
+        for (int j = 0; j < size; j++) {
+          int index = topNIndex[j];
+          if (j < topNBiasWeightLen) {
+            originPrimalSolutionData[index] = originVariablesTopNBiasWeight[j];
+          } else {
+            originPrimalSolutionData[index] = 0.0;
+          }
+        }
+      }
+}
